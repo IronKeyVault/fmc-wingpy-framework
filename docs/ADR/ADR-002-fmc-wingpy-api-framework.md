@@ -1,11 +1,13 @@
-# ADR-002: FMC wingpy API Framework
+# ADR-002: FMC wingpy API Framework — Security & Hardening
 
 **Status:** Active
-**Date:** 2026-02-26
+**Date:** 2026-02-26 (updated 2026-03-13)
 
 ## Context
 
 We need a standardized approach for automating Cisco Firepower Management Center (FMC) via its REST API. The `wingpy` library provides a Python SDK that handles authentication, token management, and API calls.
+
+A subsequent security review (2026-03-13) identified hardening areas that all FMC tooling built on this framework must address: TLS certificate validation, API filter injection, input validation, path traversal, and file permissions. These patterns are derived from lessons learned in the `asa2fmc` project.
 
 ## Decision
 
@@ -48,7 +50,7 @@ fmc = CiscoFMC(
     host="10.0.0.1",
     username="api-user",
     password="secret",
-    verify=False,  # Set True in production with valid certs
+    verify="/path/to/fmc-ca-bundle.pem",  # See §3 for TLS options
 )
 # No API call yet — auth happens on first .get() / .post() / etc.
 ```
@@ -65,6 +67,7 @@ fmc = CiscoFMC(
 | `FMC_USERNAME` | API user username | Yes |
 | `FMC_PASSWORD` | API user password | Yes |
 | `FMC_VERIFY_SSL` | Verify TLS certificate (`true`/`false`) | No (default: `false`) |
+| `FMC_CA_BUNDLE` | Path to CA bundle or self-signed cert (`.pem`) | No |
 
 ### `.env` File
 
@@ -75,6 +78,7 @@ FMC_HOST=
 FMC_USERNAME=
 FMC_PASSWORD=
 FMC_VERIFY_SSL=false
+FMC_CA_BUNDLE=
 ```
 
 ### Loading Credentials
@@ -86,13 +90,22 @@ from wingpy import CiscoFMC
 
 load_dotenv()
 
+def _resolve_verify():
+    """Resolve TLS verify setting: CA bundle path > bool flag > False (fallback)."""
+    ca_bundle = os.getenv("FMC_CA_BUNDLE")
+    if ca_bundle:
+        return os.path.realpath(os.path.expanduser(ca_bundle))
+    return os.getenv("FMC_VERIFY_SSL", "false").lower() == "true"
+
 fmc = CiscoFMC(
     host=os.environ["FMC_HOST"],
     username=os.environ["FMC_USERNAME"],
     password=os.environ["FMC_PASSWORD"],
-    verify=os.getenv("FMC_VERIFY_SSL", "false").lower() == "true",
+    verify=_resolve_verify(),
 )
 ```
+
+> **Note:** When `verify=False` is used (no CA bundle configured), a warning should be logged. Operators should export the FMC self-signed certificate and set `FMC_CA_BUNDLE` in production.
 
 ---
 
@@ -179,9 +192,138 @@ except Exception as e:
 
 ---
 
+## 7. Security Hardening (2026-03-13)
+
+All tooling built on this framework must implement the following hardening patterns. These are derived from the `asa2fmc` security review and apply to any project that interacts with FMC.
+
+### 7.1 TLS Certificate Verification
+
+**Problem:** FMC typically uses self-signed certificates, leading developers to hardcode `verify=False`. This disables all TLS validation and exposes credentials to MITM attacks.
+
+**Required pattern:** Support custom CA bundles via `FMC_CA_BUNDLE` environment variable (see §3). The `verify` parameter should accept:
+- `str`: path to a custom CA bundle or self-signed cert file (preferred)
+- `True`: use system CA store
+- `False`: disable verification — logs a warning, acceptable only in development
+
+**Trade-off:** Default still falls back to `verify=False` when no CA bundle is configured, to preserve backwards compatibility. Operators should export the FMC certificate and configure `FMC_CA_BUNDLE` in production.
+
+### 7.2 UUID Validation for Bulk Operations
+
+**Problem:** When building filter strings for bulk delete/update operations (e.g., `ids:id1,id2,...`), unvalidated IDs can inject additional filter parameters.
+
+**Required pattern:** Validate all object IDs as proper UUIDs before building filter strings:
+
+```python
+import uuid
+
+def validate_uuids(ids: list[str]) -> list[str]:
+    """Validate and return list of UUID strings. Raises ValueError on invalid ID."""
+    validated = []
+    for id_str in ids:
+        uuid.UUID(id_str)  # Raises ValueError if invalid
+        validated.append(id_str)
+    return validated
+```
+
+### 7.3 Object Name Validation
+
+**Problem:** Object names from user-supplied files passed directly to the FMC API without validation. Names with special characters, excessive length, or control characters can cause unexpected behavior.
+
+**Required pattern:** Validate object names before sending to FMC:
+- Non-empty, max 128 characters (FMC limit)
+- Allowed characters: `\w`, space, `.`, `:`, `/`, `-`
+
+```python
+import re
+
+def validate_object_name(name: str) -> bool:
+    """Validate FMC object name. Returns True if valid."""
+    if not name or len(name) > 128:
+        return False
+    return bool(re.match(r'^[\w .:/\-]+$', name))
+```
+
+Invalid names should be logged and skipped rather than causing failures.
+
+### 7.4 IP Address & Network Validation
+
+**Problem:** IP addresses, CIDRs, and ranges from user input passed through to FMC without validation.
+
+**Required pattern:** Validate all network values using Python's `ipaddress` module:
+
+```python
+import ipaddress
+
+def validate_ip(value: str) -> bool:
+    """Validate a single IP address."""
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+def validate_network(value: str) -> bool:
+    """Validate a CIDR network."""
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return True
+    except ValueError:
+        return False
+```
+
+### 7.5 Path Canonicalization
+
+**Problem:** User-supplied file paths using `os.path.expanduser()` without `os.path.realpath()` or `Path.resolve()` allow symlink-based path traversal.
+
+**Required pattern:** Always canonicalize user-supplied paths:
+
+```python
+from pathlib import Path
+
+def safe_path(raw: str) -> Path:
+    """Resolve and canonicalize a user-supplied path."""
+    return Path(raw).expanduser().resolve()
+```
+
+### 7.6 Log File Permissions
+
+**Problem:** Log files created with default umask (typically 0644) are world-readable. Logs may contain object names, IP addresses, and operational details.
+
+**Required pattern:** Set log files to `0o640` (owner read/write, group read, no world access):
+
+```python
+import os
+
+def secure_log_file(path: str):
+    """Set restrictive permissions on log file."""
+    os.chmod(path, 0o640)
+```
+
+### Hardening Properties
+
+| Attack Vector | Without Hardening | With Hardening |
+|--------------|-------------------|----------------|
+| MITM on FMC connection | Possible (verify=False) | Mitigated with CA bundle |
+| Filter injection via bulk operations | Possible with crafted IDs | Blocked by UUID validation |
+| Malformed object names to API | Passed through | Validated and rejected |
+| Invalid IPs/CIDRs | Passed through | Validated via ipaddress module |
+| Symlink path traversal | Possible | Blocked by path canonicalization |
+| Log file exposure | World-readable (0644) | Group-readable (0640) |
+
+---
+
 ## Consequences
 
+**Positive:**
 - All FMC API automation uses a single, consistent pattern
 - Credentials never appear in source code or version control
 - Token lifecycle is managed automatically by wingpy
 - API users follow least-privilege principle
+- Defense-in-depth against injection, traversal, and MITM
+- Invalid input fails early with clear log messages
+- No breaking changes — existing workflows continue to work
+
+**Negative:**
+- Object names with unusual characters (outside `[\w .:/\-]`) are rejected
+- Adds slight complexity to credential loading (CA bundle resolution)
+- `verify=False` remains the fallback default when no CA bundle is configured

@@ -1,0 +1,64 @@
+[build-system]
+requires = [
+    "setuptools>=65.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fmc-wingpy"
+version = "0.1.0"
+description = "Generic framework for secure Cisco FMC API automation"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Kasper Elsborg - Wingmen" },
+]
+keywords = [
+    "cisco",
+    "fmc",
+    "firewall",
+    "security",
+    "automation",
+    "framework",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Networking :: Firewalls",
+]
+dependencies = [
+    "wingpy>=0.3.0",
+    "keyring>=23.0.0",
+    "cryptography>=3.4",
+]
+
+[project.license]
+text = "Proprietary"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black>=22.0",
+    "flake8>=4.0",
+]
+
+[project.scripts]
+fmc-wingpy = "fmc_wingpy.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/IronKeyVault/fmc-wingpy-framework"
+Repository = "https://github.com/IronKeyVault/fmc-wingpy-framework"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
