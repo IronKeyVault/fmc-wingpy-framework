@@ -1,0 +1,12 @@
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_ed25519
+.ssh/
+.env
+.env.*
